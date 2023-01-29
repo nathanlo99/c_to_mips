@@ -44,6 +44,8 @@ bne $1, $0, nonzero
 ; Zero case
 sw $10, 0($8)           ; print 0
 beq $0, $0, postamble
+
+nonzero:
 slt $2, $1, $0          ; $2 is 1 iff num is negative
 beq $2, $0, positive    ; If $2 == 1, then print a minus sign and negate $1
 sw $9, 0($8)            ; print -
