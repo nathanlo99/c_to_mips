@@ -3,7 +3,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::{env, process, u8};
 
@@ -168,6 +168,42 @@ impl Instruction {
             _ => unreachable!(),
         }
     }
+
+    fn disassemble(word: u32) -> Instruction {
+        let first_opcode = word >> 26;
+        let second_opcode = word & 0b111111;
+        let s = ((word >> 21) & 0b11111) as u8;
+        let t = ((word >> 16) & 0b11111) as u8;
+        let d = ((word >> 11) & 0b11111) as u8;
+        let i = Value::Literal(word & 0xFFFF);
+        match first_opcode {
+            0b100011 => Instruction::Lw { t, i, s },
+            0b101011 => Instruction::Sw { t, i, s },
+            0b000100 => Instruction::Beq { s, t, i },
+            0b000101 => Instruction::Bne { s, t, i },
+            0b000000 => match second_opcode {
+                0b100000 => Instruction::Add { s, t, d },
+                0b100010 => Instruction::Sub { s, t, d },
+                0b011000 => Instruction::Mult { s, t },
+                0b011001 => Instruction::Multu { s, t },
+                0b011010 => Instruction::Div { s, t },
+                0b011011 => Instruction::Divu { s, t },
+                0b010000 => Instruction::Mfhi { d },
+                0b010010 => Instruction::Mflo { d },
+                0b010100 => Instruction::Lis { d },
+                0b101010 => Instruction::Slt { d, s, t },
+                0b101011 => Instruction::Sltu { d, s, t },
+                0b001000 => Instruction::Jr { s },
+                0b001001 => Instruction::Jalr { s },
+                _ => Instruction::Word {
+                    i: Value::Literal(word),
+                },
+            },
+            _ => Instruction::Word {
+                i: Value::Literal(word),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -194,13 +230,14 @@ where
     Ok(io::BufReader::new(file).lines())
 }
 
-fn parse_value(value: &str) -> Value {
+fn parse_value(value: &str, bits: u8) -> Value {
+    let mask: u32 = ((1_u64 << bits) - 1) as u32;
     if let Ok(num) = value.parse::<u32>() {
-        Value::Literal(num)
+        Value::Literal(num & mask)
     } else if let Ok(num) = value.parse::<i32>() {
-        Value::Literal(num as u32)
+        Value::Literal((num as u32) & mask)
     } else if let Ok(num) = u32::from_str_radix(&value[2..], 16) {
-        Value::Literal(num)
+        Value::Literal(num & mask)
     } else {
         Value::Label(value.to_string())
     }
@@ -262,23 +299,23 @@ fn parse_instruction(instruction: String) -> Instruction {
         },
         Some(&"lw") => Instruction::Lw {
             t: tokens[1][1..].parse().unwrap(),
-            i: parse_value(tokens[2]),
+            i: parse_value(tokens[2], 16),
             s: tokens[3][1..].parse().unwrap(),
         },
         Some(&"sw") => Instruction::Sw {
             t: tokens[1][1..].parse().unwrap(),
-            i: parse_value(tokens[2]),
+            i: parse_value(tokens[2], 16),
             s: tokens[3][1..].parse().unwrap(),
         },
         Some(&"beq") => Instruction::Beq {
             s: tokens[1][1..].parse().unwrap(),
             t: tokens[2][1..].parse().unwrap(),
-            i: parse_value(tokens[3]),
+            i: parse_value(tokens[3], 16),
         },
         Some(&"bne") => Instruction::Bne {
             s: tokens[1][1..].parse().unwrap(),
             t: tokens[2][1..].parse().unwrap(),
-            i: parse_value(tokens[3]),
+            i: parse_value(tokens[3], 16),
         },
         Some(&"jr") => Instruction::Jr {
             s: tokens[1][1..].parse().unwrap(),
@@ -287,7 +324,7 @@ fn parse_instruction(instruction: String) -> Instruction {
             s: tokens[1][1..].parse().unwrap(),
         },
         Some(&".word") => Instruction::Word {
-            i: parse_value(tokens[1]),
+            i: parse_value(tokens[1], 32),
         },
         Some(other) => panic!("Unrecognized instruction opcode: {other}"),
     }
@@ -384,6 +421,7 @@ fn replace_labels(lines: &Vec<Line>, labels: &HashMap<&str, u32>) -> Vec<Line> {
                     .get(label.as_str())
                     .unwrap_or_else(|| panic!("Undefined label {label}"));
                 let offset = ((*label_value as i32 - addr as i32) / 4) as u32;
+                let offset = offset & 0xFFFF;
                 Instruction::Beq {
                     s: *s,
                     t: *t,
@@ -399,6 +437,7 @@ fn replace_labels(lines: &Vec<Line>, labels: &HashMap<&str, u32>) -> Vec<Line> {
                     .get(label.as_str())
                     .unwrap_or_else(|| panic!("Undefined label {label}"));
                 let offset = ((*label_value as i32 - addr as i32) / 4) as u32;
+                let offset = offset & 0xFFFF;
                 Instruction::Bne {
                     s: *s,
                     t: *t,
@@ -435,6 +474,230 @@ fn assemble(instructions: &[Line]) -> Vec<u32> {
         .collect()
 }
 
+struct MipsEmulator {
+    memory: HashMap<u32, u32>,
+    registers: [u32; 32],
+    lo: u32,
+    hi: u32,
+    pc: u32,
+}
+
+impl MipsEmulator {
+    fn new(program: &[u32]) -> MipsEmulator {
+        let mut result = MipsEmulator {
+            memory: HashMap::new(),
+            registers: [0; 32],
+            lo: 0,
+            hi: 0,
+            pc: 0,
+        };
+
+        for (idx, word) in program.iter().enumerate() {
+            result.memory.insert(idx as u32, *word);
+        }
+
+        result.registers[30] = 0x100000; // Setup stack pointer
+        result.registers[31] = 0x8123456c; // Setup caller
+        result
+    }
+
+    fn dump(&self) {
+        println!();
+        for group in 0..8 {
+            for idx in 4 * group..4 * (group + 1) {
+                let register = self.registers[idx];
+                print!("${idx:02} : 0x{register:08x}    ");
+            }
+            println!();
+        }
+        println!(
+            " hi : 0x{:08x}     lo : 0x{:08x}     pc : 0x{:08x}",
+            self.hi, self.lo, self.pc
+        );
+    }
+
+    fn read(&self, addr: u32) -> u32 {
+        // eprintln!("Read from {addr:08x}");
+        if addr == 0xffff0004 {
+            let mut buffer = [0; 1];
+            let mut handle = io::stdin().take(1);
+            let next_byte = handle.read(&mut buffer).unwrap_or(0xFF);
+            return next_byte as u32;
+        }
+        match self.memory.get(&(addr / 4)) {
+            Some(word) => *word,
+            None => panic!("Reading from uninitialized memory at address {}", self.pc),
+        }
+    }
+
+    fn write(&mut self, addr: u32, val: u32) {
+        // eprintln!("Write value {val} to {addr:08x}");
+        if addr == 0xffff000c {
+            let byte = (val & 0xFF) as u8;
+            let buffer = [byte; 1];
+            io::stdout().write_all(&buffer).expect("Could not write");
+            return;
+        }
+        self.memory.insert(addr / 4, val);
+    }
+
+    fn step(&mut self) -> bool {
+        if self.pc == 0x8123456c {
+            return false;
+        }
+
+        // Fetch
+        let word = self.read(self.pc);
+        let instruction = Instruction::disassemble(word);
+        self.pc += 4;
+
+        // eprintln!("pc = {}: {instruction}", self.pc);
+
+        // Execute
+        match instruction {
+            Instruction::Add { d, s, t } => {
+                self.registers[d as usize] =
+                    self.registers[s as usize].wrapping_add(self.registers[t as usize])
+            }
+            Instruction::Sub { d, s, t } => {
+                self.registers[d as usize] =
+                    self.registers[s as usize].wrapping_sub(self.registers[t as usize])
+            }
+            Instruction::Slt { d, s, t } => {
+                self.registers[d as usize] =
+                    if (self.registers[s as usize] as i32) < (self.registers[t as usize] as i32) {
+                        1
+                    } else {
+                        0
+                    }
+            }
+            Instruction::Sltu { d, s, t } => {
+                self.registers[d as usize] =
+                    if self.registers[s as usize] <= self.registers[t as usize] {
+                        1
+                    } else {
+                        0
+                    }
+            }
+
+            Instruction::Mult { s, t } => {
+                // TODO: Check if this sign-extends properly
+                let product = ((self.registers[s as usize] as i64)
+                    * (self.registers[t as usize] as i64)) as u64;
+                self.hi = (product >> 32) as u32;
+                self.lo = (product & 0xFFFFFFFF) as u32;
+            }
+            Instruction::Multu { s, t } => {
+                let product =
+                    (self.registers[s as usize] as u64) * (self.registers[t as usize] as u64);
+                self.hi = (product >> 32) as u32;
+                self.lo = (product & 0xFFFFFFFF) as u32;
+            }
+            Instruction::Div { s, t } => {
+                let s = self.registers[s as usize] as i32;
+                let t = self.registers[t as usize] as i32;
+                self.lo = (s / t) as u32;
+                self.hi = (s % t) as u32;
+            }
+            Instruction::Divu { s, t } => {
+                let s = self.registers[s as usize];
+                let t = self.registers[t as usize];
+                self.lo = s / t;
+                self.hi = s % t;
+            }
+            Instruction::Mfhi { d } => self.registers[d as usize] = self.hi,
+            Instruction::Mflo { d } => self.registers[d as usize] = self.lo,
+            Instruction::Lis { d } => {
+                self.registers[d as usize] = self.read(self.pc);
+                self.pc += 4
+            }
+            Instruction::Lw { t, ref i, s } => {
+                if let Value::Literal(ref i) = i {
+                    let i = (*i as i16) as i32;
+                    let s = self.registers[s as usize] as i32;
+                    let addr = (s + i) as u32;
+                    self.registers[t as usize] = self.read(addr);
+                } else {
+                    unreachable!()
+                }
+            }
+            Instruction::Sw { t, ref i, s } => {
+                if let Value::Literal(ref i) = i {
+                    let i = (*i as i16) as i32;
+                    let s = self.registers[s as usize] as i32;
+                    let addr = (s + i) as u32;
+                    self.write(addr, self.registers[t as usize]);
+                } else {
+                    unreachable!()
+                }
+            }
+            Instruction::Beq { s, t, ref i } => {
+                if let Value::Literal(ref i) = i {
+                    let i = (*i as i16) as i32;
+                    if s == t || self.registers[s as usize] == self.registers[t as usize] {
+                        self.pc = ((self.pc as i32) + 4 * i) as u32;
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+            Instruction::Bne { s, t, ref i } => {
+                if let Value::Literal(ref i) = i {
+                    let i = (*i as i16) as i32;
+                    if s != t && self.registers[s as usize] != self.registers[t as usize] {
+                        self.pc = ((self.pc as i32) + 4 * i) as u32;
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+            Instruction::Jr { s } => self.pc = self.registers[s as usize],
+            Instruction::Jalr { s } => {
+                let temp = self.registers[s as usize];
+                self.registers[31] = self.pc;
+                self.pc = temp;
+            }
+            _ => panic!("Unexpected instruction {word} at addr {}", self.pc),
+        }
+        true
+    }
+
+    fn run(&mut self) {
+        while self.step() {}
+    }
+}
+
+fn read_int() -> Option<u32> {
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).expect("Could not read");
+    let input = input.trim();
+    if let Ok(num) = input.parse::<u32>() {
+        return Some(num);
+    } else if let Ok(num) = input.parse::<i32>() {
+        return Some(num as u32);
+    }
+    None
+}
+
+fn emulate_twoints(machine_code: &Vec<u32>) {
+    let mut emulator: MipsEmulator = MipsEmulator::new(machine_code.as_slice());
+
+    print!("Enter value for register 1: ");
+    io::stdout().flush().expect("Could not read from stdin");
+    emulator.registers[1] = read_int().expect("Could not parse integer");
+
+    print!("Enter value for register 2: ");
+    io::stdout().flush().expect("Could not read from stdin");
+    emulator.registers[2] = read_int().expect("Could not parse integer");
+
+    for idx in 3..=29 {
+        emulator.registers[idx] = 0xfffffff6;
+    }
+
+    emulator.run();
+    emulator.dump();
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -449,19 +712,22 @@ fn main() {
     let lines = replace_labels(&lines, &label_locations);
     let machine_code = assemble(&lines);
 
-    for line in lines {
-        let bytes = line.instruction.assemble().to_be_bytes();
-        eprintln!(
-            "{:08b} {:08b} {:08b} {:08b} | {}",
-            bytes[0], bytes[1], bytes[2], bytes[3], line.text
-        );
-    }
+    // for line in lines {
+    //     let word = line.instruction.assemble();
+    //     let bytes = word.to_be_bytes();
+    //     eprintln!(
+    //         "{:08b} {:08b} {:08b} {:08b} | {}",
+    //         bytes[0], bytes[1], bytes[2], bytes[3], line.text
+    //     );
+    // }
 
     let mut bytes = Vec::<u8>::new();
-    for word in machine_code {
+    for word in &machine_code {
         bytes.extend_from_slice(&word.to_be_bytes())
     }
-    io::stdout()
-        .write_all(bytes.as_slice())
-        .expect("Writing failed");
+    // io::stdout()
+    //     .write_all(bytes.as_slice())
+    //     .expect("Writing failed");
+
+    emulate_twoints(&machine_code);
 }
