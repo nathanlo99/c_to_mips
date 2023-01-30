@@ -3,7 +3,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::{env, process, u8};
 
@@ -18,6 +18,15 @@ impl fmt::Display for Value {
         match *self {
             Value::Literal(val) => write!(f, "{}", val as i32),
             Value::Label(ref s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl Value {
+    fn to_u32(&self) -> u32 {
+        match *self {
+            Value::Literal(val) => val,
+            Value::Label(ref _s) => panic!("Can't convert label to u32"),
         }
     }
 }
@@ -124,6 +133,39 @@ impl fmt::Display for Instruction {
             Instruction::Jalr { s } => write!(f, "jalr ${s}"),
             Instruction::Word { ref i } => write!(f, ".word {i}"),
             Instruction::Noop => write!(f, ""),
+        }
+    }
+}
+
+fn std_word(s: u8, t: u8, d: u8, opcode: u16) -> u32 {
+    ((s as u32) << 21) | ((t as u32) << 16) | ((d as u32) << 11) | (opcode as u32)
+}
+fn sti_word(opcode: u8, s: u8, t: u8, i: u32) -> u32 {
+    ((opcode as u32) << 26) | ((s as u32) << 21) | ((t as u32) << 16) | (i & 0xFFFF)
+}
+
+impl Instruction {
+    fn assemble(&self) -> u32 {
+        match *self {
+            Instruction::Add { d, s, t } => std_word(s, t, d, 0x20),
+            Instruction::Sub { d, s, t } => std_word(s, t, d, 0x22),
+            Instruction::Slt { d, s, t } => std_word(s, t, d, 0x2a),
+            Instruction::Sltu { d, s, t } => std_word(s, t, d, 0x2b),
+            Instruction::Mult { s, t } => std_word(s, t, 0, 0x18),
+            Instruction::Multu { s, t } => std_word(s, t, 0, 0x19),
+            Instruction::Div { s, t } => std_word(s, t, 0, 0x1a),
+            Instruction::Divu { s, t } => std_word(s, t, 0, 0x1b),
+            Instruction::Mfhi { d } => std_word(0, 0, d, 0x10),
+            Instruction::Mflo { d } => std_word(0, 0, d, 0x12),
+            Instruction::Lis { d } => std_word(0, 0, d, 0x14),
+            Instruction::Lw { t, ref i, s } => sti_word(0b100011, s, t, i.to_u32()),
+            Instruction::Sw { t, ref i, s } => sti_word(0b101011, s, t, i.to_u32()),
+            Instruction::Beq { s, t, ref i } => sti_word(0b000100, s, t, i.to_u32()),
+            Instruction::Bne { s, t, ref i } => sti_word(0b000101, s, t, i.to_u32()),
+            Instruction::Jr { s } => sti_word(0b000000, s, 0, 0b1000),
+            Instruction::Jalr { s } => sti_word(0b000000, s, 0, 0b1001),
+            Instruction::Word { ref i } => i.to_u32(),
+            _ => unreachable!(),
         }
     }
 }
@@ -255,6 +297,7 @@ fn parse_line(line: String) -> Line {
     lazy_static! {
         static ref LABELS_RE: Regex = Regex::new(r"[a-zA-Z][a-zA-Z0-9]*:").unwrap();
     }
+    let original_line = line.trim();
     let semicolon_index = line.find(';').unwrap_or(line.len());
     let line = &line[..semicolon_index].trim();
 
@@ -268,7 +311,7 @@ fn parse_line(line: String) -> Line {
         .collect();
 
     Line {
-        text: line.to_string(),
+        text: original_line.to_string(),
         labels,
         instruction: parse_instruction(instruction.to_string()),
     }
@@ -296,14 +339,14 @@ fn extract_label_locations(lines: &Vec<Line>) -> HashMap<&str, u32> {
     result
 }
 
-fn replace_labels(lines: &Vec<Line>, labels: &HashMap<&str, u32>) -> Vec<Instruction> {
+fn replace_labels(lines: &Vec<Line>, labels: &HashMap<&str, u32>) -> Vec<Line> {
     let mut result = Vec::new();
     let mut addr: u32 = 0;
     for line in lines {
         if line.instruction != Instruction::Noop {
             addr += 4;
         }
-        let new_line = match &line.instruction {
+        let new_instruction = match &line.instruction {
             Instruction::Lw {
                 t,
                 i: Value::Label(label),
@@ -374,15 +417,23 @@ fn replace_labels(lines: &Vec<Line>, labels: &HashMap<&str, u32>) -> Vec<Instruc
             }
             other => other.clone(),
         };
-        result.push(new_line);
+        if new_instruction != Instruction::Noop {
+            result.push(Line {
+                text: line.text.clone(),
+                instruction: new_instruction,
+                labels: Vec::new(),
+            });
+        }
     }
     result
 }
 
-// struct MipsEmulator {
-//     memory: HashMap<u32, u32>,
-
-// }
+fn assemble(instructions: &[Line]) -> Vec<u32> {
+    instructions
+        .iter()
+        .map(|line| line.instruction.assemble())
+        .collect()
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -395,13 +446,22 @@ fn main() {
     let lines = read_lines(mips_file).expect("Could not open MIPS file");
     let lines = parse_lines(lines);
     let label_locations = extract_label_locations(&lines);
-    let instructions = replace_labels(&lines, &label_locations);
+    let lines = replace_labels(&lines, &label_locations);
+    let machine_code = assemble(&lines);
 
-    // run_mips(&instructions);
-
-    for instruction in instructions {
-        if instruction != Instruction::Noop {
-            println!("{instruction}")
-        }
+    for line in lines {
+        let bytes = line.instruction.assemble().to_be_bytes();
+        eprintln!(
+            "{:08b} {:08b} {:08b} {:08b} | {}",
+            bytes[0], bytes[1], bytes[2], bytes[3], line.text
+        );
     }
+
+    let mut bytes = Vec::<u8>::new();
+    for word in machine_code {
+        bytes.extend_from_slice(&word.to_be_bytes())
+    }
+    io::stdout()
+        .write_all(bytes.as_slice())
+        .expect("Writing failed");
 }
