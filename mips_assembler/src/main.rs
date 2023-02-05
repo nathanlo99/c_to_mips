@@ -526,7 +526,10 @@ impl MipsEmulator {
         }
         match self.memory.get(&(addr / 4)) {
             Some(word) => *word,
-            None => panic!("Reading from uninitialized memory at address {}", self.pc),
+            None => {
+                self.dump();
+                panic!("Reading from uninitialized memory at address {}", self.pc)
+            }
         }
     }
 
@@ -551,7 +554,7 @@ impl MipsEmulator {
         let instruction = Instruction::disassemble(word);
         self.pc += 4;
 
-        // eprintln!("pc = {}: {instruction}", self.pc);
+        eprintln!("pc = {}: {instruction}", self.pc);
 
         // Execute
         match instruction {
@@ -667,31 +670,41 @@ impl MipsEmulator {
     }
 }
 
-fn read_int() -> Option<u32> {
+fn read_int(prompt: &str) -> u32 {
+    print!("{prompt}");
+    io::stdout().flush().expect("Could not read from stdin");
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("Could not read");
     let input = input.trim();
     if let Ok(num) = input.parse::<u32>() {
-        return Some(num);
+        return num;
     } else if let Ok(num) = input.parse::<i32>() {
-        return Some(num as u32);
+        return num as u32;
     }
-    None
+    panic!("Could not parse integer");
 }
 
 fn emulate_twoints(machine_code: &Vec<u32>) {
     let mut emulator: MipsEmulator = MipsEmulator::new(machine_code.as_slice());
 
-    print!("Enter value for register 1: ");
-    io::stdout().flush().expect("Could not read from stdin");
-    emulator.registers[1] = read_int().expect("Could not parse integer");
+    emulator.registers[1] = read_int("Enter value for register 1: ");
+    emulator.registers[2] = read_int("Enter value for register 2: ");
 
-    print!("Enter value for register 2: ");
-    io::stdout().flush().expect("Could not read from stdin");
-    emulator.registers[2] = read_int().expect("Could not parse integer");
+    emulator.run();
+    emulator.dump();
+}
 
-    for idx in 3..=29 {
-        emulator.registers[idx] = 0xfffffff6;
+fn emulate_mipsarray(machine_code: &Vec<u32>) {
+    let mut emulator: MipsEmulator = MipsEmulator::new(machine_code.as_slice());
+
+    let start_address = (machine_code.len() as u32) * 4 + 8;
+    let array_length = read_int("Enter length of array: ");
+    emulator.registers[1] = start_address;
+    emulator.registers[2] = array_length;
+
+    for idx in 0..array_length {
+        let entry = read_int(format!("Enter the value of arr[{idx}]: ").as_str());
+        emulator.write(start_address + 4 * idx, entry);
     }
 
     emulator.run();
@@ -729,5 +742,6 @@ fn main() {
     //     .write_all(bytes.as_slice())
     //     .expect("Writing failed");
 
-    emulate_twoints(&machine_code);
+    // emulate_twoints(&machine_code);
+    emulate_mipsarray(&machine_code);
 }
